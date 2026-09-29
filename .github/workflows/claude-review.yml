@@ -178,6 +178,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # El job "disparar" lanza esta revisión como el bot github-actions: hay que permitirlo.
+          allowed_bots: github-actions
           prompt: |
             REPO: ${{ github.repository }}
             RAMA: ${{ github.ref_name }}

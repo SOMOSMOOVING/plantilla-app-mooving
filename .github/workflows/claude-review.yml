@@ -3,6 +3,10 @@
 # - En push directo a main/master: si encuentra algo Crítico, Alto o Medio, abre un issue.
 # - Manual (pestaña Actions → "Run workflow"): revisa los últimos N commits.
 # La rúbrica está en .github/claude-review.md (editala ahí, no acá).
+#
+# Nota: la acción de Claude no acepta el evento "push". Por eso, cuando hay un push,
+# el job "disparar" lanza este mismo workflow como ejecución manual (workflow_dispatch)
+# indicándole qué commits revisar.
 
 name: Revisión de código (Claude)
 
@@ -19,21 +23,68 @@ on:
         description: "Cuántos commits hacia atrás revisar"
         required: false
         default: "10"
-
-# En un PR, si subís otro cambio mientras corre, cancela la revisión vieja (la nueva revisa todo el PR).
-# En push directo no cancela, para que ningún push quede sin revisar.
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      base:
+        description: "(uso interno) commit desde el cual revisar; dejar vacío"
+        required: false
+        default: ""
+      head:
+        description: "(uso interno) commit hasta el cual revisar; dejar vacío"
+        required: false
+        default: ""
 
 jobs:
+  # ---------- Push directo: sólo dispara la revisión ----------
+  disparar:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Lanzar la revisión de este push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          ARBOL_VACIO=$(git hash-object -t tree /dev/null)
+          HEAD="$GITHUB_SHA"
+          BASE="$PUSH_BEFORE"
+          if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE=$(git rev-parse --verify -q "${HEAD}~1^{commit}" || echo "$ARBOL_VACIO")
+          fi
+
+          # Si este push es el merge de un PR, ya se revisó en el PR: no repetir.
+          PRS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/pulls" --jq 'length' 2>/dev/null) || PRS=0
+          if [[ "$PRS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Este push viene de un Pull Request ya revisado. No se repite."
+            exit 0
+          fi
+
+          echo "Lanzando revisión de $BASE a $HEAD"
+          gh workflow run claude-review.yml --ref "$GITHUB_REF_NAME" -f base="$BASE" -f head="$HEAD"
+
+  # ---------- Revisión con Claude (Pull Requests y ejecuciones manuales) ----------
   revision:
-    # No revisa PRs en borrador ni PRs de Dependabot (no tienen acceso a los secrets).
+    # No revisa pushes (los lanza "disparar"), PRs en borrador ni PRs de Dependabot.
     if: >-
+      github.event_name != 'push' &&
       github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # En un PR, si subís otro cambio mientras corre, cancela la revisión vieja (la nueva revisa todo el PR).
+    # Las revisiones de push/manuales no se cancelan entre sí.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
       pull-requests: write
@@ -51,12 +102,12 @@ jobs:
       - name: Definir qué revisar
         id: alcance
         env:
-          GH_TOKEN: ${{ github.token }}
           EVENTO: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          N_COMMITS: ${{ github.event.inputs.commits }}
+          IN_COMMITS: ${{ github.event.inputs.commits }}
+          IN_BASE: ${{ github.event.inputs.base }}
+          IN_HEAD: ${{ github.event.inputs.head }}
         run: |
           set -euo pipefail
           ARBOL_VACIO=$(git hash-object -t tree /dev/null)
@@ -64,18 +115,26 @@ jobs:
 
           if [ "$EVENTO" = "pull_request" ]; then
             BASE="$PR_BASE"; HEAD="$PR_HEAD"; MODO="pr"
-          elif [ "$EVENTO" = "push" ]; then
-            HEAD="$GITHUB_SHA"; BASE="$PUSH_BEFORE"; MODO="push"
-            if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-              BASE=$(git rev-parse --verify -q "${HEAD}~1^{commit}" || echo "$ARBOL_VACIO")
-            fi
-            # Si este push es el merge de un PR, ya se revisó en el PR: no repetir.
-            PRS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/pulls" --jq 'length' 2>/dev/null) || PRS=0
-            if [[ "$PRS" =~ ^[1-9][0-9]*$ ]]; then SALTEAR=true; fi
           else
-            HEAD="$GITHUB_SHA"; MODO="push"
-            N="${N_COMMITS:-10}"
-            BASE=$(git rev-parse --verify -q "${HEAD}~${N}^{commit}" || echo "$ARBOL_VACIO")
+            MODO="push"
+            # HEAD: el indicado por "disparar", o el último commit de la rama.
+            if [ -n "${IN_HEAD:-}" ]; then
+              HEAD=$(git rev-parse --verify -q "${IN_HEAD}^{commit}") || { echo "head inválido"; exit 1; }
+            else
+              HEAD="$GITHUB_SHA"
+            fi
+            # BASE: el indicado por "disparar", o N commits hacia atrás.
+            if [ -n "${IN_BASE:-}" ]; then
+              if [ "$IN_BASE" = "$ARBOL_VACIO" ]; then
+                BASE="$ARBOL_VACIO"
+              else
+                BASE=$(git rev-parse --verify -q "${IN_BASE}^{commit}") || { echo "base inválido"; exit 1; }
+              fi
+            else
+              N="${IN_COMMITS:-10}"
+              [[ "$N" =~ ^[0-9]+$ ]] || N=10
+              BASE=$(git rev-parse --verify -q "${HEAD}~${N}^{commit}" || echo "$ARBOL_VACIO")
+            fi
           fi
 
           ARCHIVOS=$(git diff --name-only "$BASE" "$HEAD" | wc -l)
